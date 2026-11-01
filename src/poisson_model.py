@@ -33,9 +33,9 @@ class PoissonGoalModel:
         rho por máxima verosimilitud sobre los marcadores bajos del histórico.
 
         Usa groupby() en vez de filtrar el dataframe completo por cada equipo
-        (`matches[matches["home_team"] == team]` recorre las 49k+ filas una
-        vez POR EQUIPO, ~300 pasadas completas al dataset). groupby() hace
-        el mismo cálculo en una sola pasada, mismo resultado, mucho más rápido."""
+        (`matches[matches["home_team"] == team]` recorre todas las filas una
+        vez POR EQUIPO). groupby() hace el mismo cálculo en una sola pasada,
+        mismo resultado, mucho más rápido."""
         self.avg_home_goals = matches["home_score"].mean()
         self.avg_away_goals = matches["away_score"].mean()
         league_avg = (self.avg_home_goals + self.avg_away_goals) / 2
@@ -87,14 +87,8 @@ class PoissonGoalModel:
         away_attack = matches["away_team"].map(self.team_attack).fillna(1.0).to_numpy()
         away_defense = matches["away_team"].map(self.team_defense).fillna(1.0).to_numpy()
 
-        if "neutral" in matches.columns:
-            neutral = matches["neutral"].to_numpy(dtype=bool)
-        else:
-            neutral = np.zeros(len(matches), dtype=bool)
-
-        avg_neutral = (self.avg_home_goals + self.avg_away_goals) / 2
-        lam = np.where(neutral, home_attack * away_defense * avg_neutral, home_attack * away_defense * self.avg_home_goals)
-        mu = np.where(neutral, away_attack * home_defense * avg_neutral, away_attack * home_defense * self.avg_away_goals)
+        lam = home_attack * away_defense * self.avg_home_goals
+        mu = away_attack * home_defense * self.avg_away_goals
 
         x = matches["home_score"].to_numpy()
         y = matches["away_score"].to_numpy()
@@ -124,29 +118,21 @@ class PoissonGoalModel:
         self.rho = float(result.x)
         return self.rho
 
-    def expected_goals(self, home_team: str, away_team: str, neutral: bool = False) -> tuple[float, float]:
+    def expected_goals(self, home_team: str, away_team: str) -> tuple[float, float]:
         home_attack = self.team_attack.get(home_team, 1.0)
         home_defense = self.team_defense.get(home_team, 1.0)
         away_attack = self.team_attack.get(away_team, 1.0)
         away_defense = self.team_defense.get(away_team, 1.0)
 
-        if neutral:
-            # En sede neutral no tiene sentido aplicar el sesgo "local mete más
-            # goles que visitante" que el modelo aprendió de la liga regular.
-            # Usamos el promedio general de goles por partido para ambos lados.
-            avg_goals = (self.avg_home_goals + self.avg_away_goals) / 2
-            exp_home_goals = home_attack * away_defense * avg_goals
-            exp_away_goals = away_attack * home_defense * avg_goals
-        else:
-            exp_home_goals = home_attack * away_defense * self.avg_home_goals
-            exp_away_goals = away_attack * home_defense * self.avg_away_goals
+        exp_home_goals = home_attack * away_defense * self.avg_home_goals
+        exp_away_goals = away_attack * home_defense * self.avg_away_goals
 
         return exp_home_goals, exp_away_goals
 
-    def score_matrix(self, home_team: str, away_team: str, neutral: bool = False) -> np.ndarray:
+    def score_matrix(self, home_team: str, away_team: str) -> np.ndarray:
         """Matriz de probabilidad para cada marcador posible (home_goals x away_goals),
         con la corrección Dixon-Coles aplicada a las 4 celdas de marcador bajo si rho != 0."""
-        exp_home, exp_away = self.expected_goals(home_team, away_team, neutral=neutral)
+        exp_home, exp_away = self.expected_goals(home_team, away_team)
 
         home_probs = [poisson.pmf(i, exp_home) for i in range(self.max_goals + 1)]
         away_probs = [poisson.pmf(i, exp_away) for i in range(self.max_goals + 1)]
@@ -160,13 +146,13 @@ class PoissonGoalModel:
 
         return matrix
 
-    def top_scores(self, home_team: str, away_team: str, neutral: bool = False, n: int = 3) -> list[tuple[str, float]]:
+    def top_scores(self, home_team: str, away_team: str, n: int = 3) -> list[tuple[str, float]]:
         """Devuelve los n marcadores más probables como [('1-1', 0.14), ('1-0', 0.11), ...].
         Más informativo que un solo 'marcador más probable': con goles esperados
         bajos (típico en fútbol), la moda de Poisson concentra mucha masa en 1-1
         aunque un equipo sea claramente favorito, así que un solo marcador
         aislado puede ser engañoso sobre quién es favorito."""
-        matrix = self.score_matrix(home_team, away_team, neutral=neutral)
+        matrix = self.score_matrix(home_team, away_team)
         flat_indices = np.argsort(matrix.ravel())[::-1][:n]
         scores = []
         for idx in flat_indices:
@@ -174,17 +160,16 @@ class PoissonGoalModel:
             scores.append((f"{h}-{a}", round(float(matrix[h, a]), 4)))
         return scores
 
-    def predict(self, home_team: str, away_team: str, neutral: bool = False) -> dict:
-        """Probabilidades 1X2, marcador más probable y top-3 de marcadores.
-        neutral=True para partidos en sede neutral (ej. semifinales de un Mundial)."""
-        matrix = self.score_matrix(home_team, away_team, neutral=neutral)
+    def predict(self, home_team: str, away_team: str) -> dict:
+        """Probabilidades 1X2, marcador más probable y top-3 de marcadores."""
+        matrix = self.score_matrix(home_team, away_team)
 
         p_home_win = np.tril(matrix, -1).sum()
         p_draw = np.trace(matrix)
         p_away_win = np.triu(matrix, 1).sum()
 
         most_likely_idx = np.unravel_index(matrix.argmax(), matrix.shape)
-        top_scores = self.top_scores(home_team, away_team, neutral=neutral, n=3)
+        top_scores = self.top_scores(home_team, away_team, n=3)
 
         return {
             "home_win": round(float(p_home_win), 4),
@@ -202,5 +187,5 @@ if __name__ == "__main__":
     model = PoissonGoalModel().fit(matches)
 
     print(f"Rho (Dixon-Coles) ajustado: {model.rho:.4f}")
-    print("Predicción Brazil vs Argentina:")
-    print(model.predict("Brazil", "Argentina"))
+    print("Predicción América vs Chivas:")
+    print(model.predict("América", "Chivas"))

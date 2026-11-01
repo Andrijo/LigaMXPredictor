@@ -1,25 +1,26 @@
-# World Cup 2026 Match Predictor
+# Liga MX Match Predictor
 
-Proyecto de práctica diaria en Python: predicción de partidos del Mundial 2026
-usando datos históricos de más de 49,000 partidos internacionales desde 1872.
+Proyecto de práctica diaria en Python: predicción de partidos de Liga MX con un
+ensemble Elo + Poisson (Dixon-Coles), usando todos los partidos de Primera
+División desde el Apertura 2012, más un simulador de liguilla Monte Carlo.
 
 ## Estructura del proyecto
 
 ```
-worldcup2026-predictor/
+.
 ├── data/
 │   ├── raw/              # datos crudos descargados
 │   └── processed/        # datos limpios listos para modelar
 ├── src/
-│   ├── data_loader.py    # descarga y limpieza de datos
+│   ├── data_loader.py    # descarga, limpieza y actualización de datos
 │   ├── elo.py             # Day 1 - modelo Elo
 │   ├── poisson_model.py   # Day 2 - modelo de goles Poisson (Dixon-Coles)
 │   ├── ensemble.py        # Day 3 - combina Elo + Poisson
-│   ├── league_config.py   # configuración por liga (World Cup / Liga MX)
+│   ├── league_config.py   # parámetros de Liga MX y nombres de equipos
 │   ├── backtest.py        # validación walk-forward fuera de muestra
-│   ├── liguilla.py        # simulador de liguilla Monte Carlo (Liga MX)
+│   ├── liguilla.py        # simulador de liguilla Monte Carlo
 │   ├── model_cache.py     # persistencia de modelos entrenados en disco
-│   └── utils.py           # utilidades generales
+│   └── utils.py           # tabla general, torneos y utilidades
 ├── app/
 │   └── dashboard.py       # interfaz interactiva con Streamlit
 ├── tests/                 # tests unitarios
@@ -37,11 +38,14 @@ pip install -r requirements.txt
 
 ## Uso
 
-### 1. Descargar y preparar los datos
+### 1. Descargar los datos
 
 ```bash
 python -m src.data_loader
 ```
+
+Es opcional: si los datos faltan o tienen más de 24 horas, se actualizan solos
+al cargarlos. Si la descarga falla, se sigue con la copia local.
 
 ### 2. Ejecutar el dashboard interactivo
 
@@ -58,26 +62,58 @@ Python donde lo instalaste:
 python -m streamlit run app/dashboard.py
 ```
 
+El dashboard incluye predicción por partido, tabla general del torneo en curso
+y simulador de liguilla a partir del top 8 actual.
+
 ### 3. Backtesting walk-forward
 
 ```bash
-python -m src.backtest --league world_cup --start-year 2015
-python -m src.backtest --league liga_mx --start-year 2021
+python -m src.backtest --start-year 2018
 ```
 
-Valida el modelo fuera de muestra usando walk-forward por año: entrena con todo
-lo anterior al año Y, predice los partidos de Y, y repite. Calcula log-loss,
-Brier score y accuracy comparando Elo, Poisson, ensemble y un baseline ingenuo.
+Valida el modelo fuera de muestra: entrena con todo lo anterior a cada
+trimestre, predice sus partidos, y repite. Calcula log-loss, Brier score y
+accuracy comparando Elo, Poisson, ensemble, un baseline ingenuo y el mercado
+(momio promedio de cierre).
 
-### 4. Simulación de liguilla (Liga MX)
+Resultados con datos hasta octubre de 2026 (2,943 partidos desde 2018):
+
+| Modelo   | Log-loss | Brier  | Accuracy |
+|----------|----------|--------|----------|
+| Ingenuo  | 1.0697   | 0.6464 | 45.2%    |
+| Elo      | 1.0303   | 0.6175 | 49.2%    |
+| Poisson  | 1.0278   | 0.6161 | 48.7%    |
+| Ensemble | 1.0259   | 0.6150 | 49.3%    |
+| Mercado  | 1.0079   | 0.6032 | 50.5%    |
+
+El ensemble le gana con claridad al baseline, pero sigue lejos del mercado: no
+sirve para encontrar valor contra las casas de apuestas.
+
+Los parámetros de `LIGA_MX` salieron de este backtest: `home_advantage=60`,
+bonus de altitud en 0 (con 25 empeoraba Elo tanto en 2018-2023 como en 2024-2026)
+y Poisson con ventana de 2 años. Cada modelo por separado mejora, pero el ensemble queda
+prácticamente igual que con los valores anteriores: combinar modelos ya absorbía
+esos errores. El simulador de liguilla usa solo Poisson, así que ahí sí importa.
+
+### 4. Simulación de liguilla
 
 ```bash
 python -m src.liguilla
 ```
 
-Simula la fase de eliminación directa de Liga MX (cuartos → semis → final)
-usando Monte Carlo con la matriz de Poisson del ensemble. Devuelve la
-probabilidad de campeonar de cada equipo clasificado.
+Simula cuartos, semis y final con Monte Carlo sobre la matriz de marcadores del
+modelo Poisson y devuelve la probabilidad de campeonar de cada equipo. Sigue el
+formato vigente, verificado contra las liguillas de 2023 a 2026:
+
+- Clasifican directo los 8 primeros, sin Play-In.
+- Cuartos: 1 vs 8, 2 vs 7, 3 vs 6, 4 vs 5.
+- En semis se reacomoda el cuadro: el mejor sembrado vivo enfrenta al peor.
+- El mejor sembrado cierra en casa.
+- Con global empatado, en cuartos y semis pasa el mejor sembrado. En la final
+  hay tiempos extra y penales (aproximados con 50/50). No hay gol de visitante.
+
+El peso de Elo del dashboard no afecta esta simulación, porque Elo no predice
+marcadores.
 
 ### 5. Caché de modelos
 
@@ -88,32 +124,28 @@ La caché se invalida automáticamente si cambian los datos o los parámetros.
 python -m src.model_cache   # benchmark: primera carga vs. desde caché
 ```
 
-## Soporte multi-liga (World Cup / Liga MX)
-
-El proyecto ahora soporta más de una competición mediante `src/league_config.py`.
-Cada liga define su fuente de datos, nombres de columnas, ventaja de local,
-altitud (Liga MX) y si tiene fase de liguilla.
-
-```bash
-# descargar y procesar datos de Liga MX
-python -m src.data_loader --league liga_mx
-
-# descargar y procesar datos de World Cup / internacional (default)
-python -m src.data_loader --league world_cup
-```
+### 6. Uso desde Python
 
 ```python
 from src.data_loader import load_processed
-from src.league_config import LIGA_MX
 from src.ensemble import EnsemblePredictor
 
-matches = load_processed(LIGA_MX)
-model = EnsemblePredictor(league=LIGA_MX).fit(matches)
+matches = load_processed()
+model = EnsemblePredictor().fit(matches)
 model.predict("América", "Chivas")
+```
+
+Los nombres de los equipos son los de `TEAM_NAMES` en `src/league_config.py`.
+
+### 7. Tests
+
+```bash
+python -m pytest tests
 ```
 
 ## Fuente de datos
 
-Partidos internacionales históricos (ej. dataset de Mark Rowan /
-"International football results from 1872 to 2024" en Kaggle, o cualquier
-fuente equivalente vía API/CSV).
+Resultados y momios de cierre de [football-data.co.uk](https://www.football-data.co.uk/mexico.php):
+fase regular y liguilla desde 2012/13. La fuente no marca qué partidos son de
+liguilla, por eso la tabla general toma los primeros 153 partidos de cada torneo.
+Tampoco trae calendario: solo partidos ya jugados, y puede ir unos días atrás.

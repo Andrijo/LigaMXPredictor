@@ -1,81 +1,94 @@
 """
-Simulador de liguilla (fase de eliminación directa a ida y vuelta) para
-Liga MX. 
+Simulador de la liguilla de Liga MX (cuartos, semis y final a ida y vuelta).
 
-Usa el EnsemblePredictor ya entrenado para simular cada serie ida/vuelta
-y hacer avanzar a los equipos por el bracket.
+Reglas que simula (formato vigente, sin Play-In):
+  - Clasifican directo los 8 primeros de la tabla general.
+  - Cuartos: 1 vs 8, 2 vs 7, 3 vs 6, 4 vs 5.
+  - Semis: se reacomoda el cuadro, el mejor sembrado que sigue vivo enfrenta
+    al peor, y los otros dos entre sí.
+  - El mejor sembrado de cada serie cierra en casa.
+  - Empate en el global: en cuartos y semis avanza el mejor sembrado; en la
+    final hay tiempos extra y penales (aproximados con 50/50). No existe el
+    gol de visitante.
+
+Usa la matriz de marcadores del modelo Poisson del EnsemblePredictor, porque
+Elo no predice marcadores y la serie se define por el global.
 """
 
-import random
+import numpy as np
+
 from src.ensemble import EnsemblePredictor
+from src.utils import LIGUILLA_TEAMS
 
 
-def simulate_single_leg(model: EnsemblePredictor, home: str, away: str) -> tuple[int, int]:
-    """Simula el marcador de un partido usando la matriz de Poisson del ensemble."""
-    matrix = model.poisson_model.score_matrix(home, away)
-    flat_probs = matrix.flatten()
-    flat_probs = flat_probs / flat_probs.sum()  # normalizar por seguridad
+class _LegSampler:
+    """Muestrea marcadores de un partido. Guarda la matriz de cada cruce: en
+    una liguilla solo hay unas decenas de cruces posibles y recalcularla en
+    cada simulación domina el tiempo de ejecución."""
 
-    max_goals = model.poisson_model.max_goals + 1
-    idx = random.choices(range(len(flat_probs)), weights=flat_probs, k=1)[0]
-    home_goals, away_goals = divmod(idx, max_goals)
-    return home_goals, away_goals
+    def __init__(self, model: EnsemblePredictor, rng: np.random.Generator):
+        self.model = model
+        self.rng = rng
+        self._probs: dict[tuple[str, str], np.ndarray] = {}
+
+    def sample(self, home: str, away: str) -> tuple[int, int]:
+        key = (home, away)
+        if key not in self._probs:
+            flat = self.model.poisson_model.score_matrix(home, away).flatten()
+            self._probs[key] = flat / flat.sum()
+
+        probs = self._probs[key]
+        idx = self.rng.choice(len(probs), p=probs)
+        size = self.model.poisson_model.max_goals + 1
+        home_goals, away_goals = divmod(int(idx), size)
+        return home_goals, away_goals
 
 
-def simulate_series(model: EnsemblePredictor, team_a: str, team_b: str) -> str:
+def simulate_series(sampler: _LegSampler, better_seed: str, worse_seed: str, is_final: bool = False) -> str:
+    """Simula una serie a ida y vuelta y devuelve al equipo que avanza."""
+    first_worse, first_better = sampler.sample(worse_seed, better_seed)   # ida en casa del peor sembrado
+    second_better, second_worse = sampler.sample(better_seed, worse_seed)  # vuelta en casa del mejor
+
+    global_better = first_better + second_better
+    global_worse = first_worse + second_worse
+
+    if global_better != global_worse:
+        return better_seed if global_better > global_worse else worse_seed
+
+    if is_final:
+        return better_seed if sampler.rng.random() < 0.5 else worse_seed
+
+    return better_seed
+
+
+def simulate_liguilla(
+    model: EnsemblePredictor,
+    seeded_teams: list[str],
+    n_simulations: int = 1000,
+    seed: int | None = None,
+) -> dict:
     """
-    Simula una serie de ida y vuelta (formato Liga MX: el mejor posicionado
-    define local en la vuelta). Si hay empate en el global, se define por
-    goles de visitante y, si persiste, por penales (coin-flip ponderado).
+    seeded_teams: los 8 clasificados en orden de la tabla (1° a 8°).
+    Devuelve la probabilidad de ser campeón de cada equipo.
     """
-    # Ida: team_b de local; Vuelta: team_a de local (mejor posicionado juega la vuelta en casa)
-    away_leg_a, away_leg_b = simulate_single_leg(model, team_b, team_a)  # ida
-    home_leg_a, home_leg_b = simulate_single_leg(model, team_a, team_b)  # vuelta
+    assert len(seeded_teams) == LIGUILLA_TEAMS, "La liguilla de Liga MX se juega con 8 equipos"
 
-    global_a = home_leg_a + away_leg_b
-    global_b = home_leg_b + away_leg_a
-
-    if global_a != global_b:
-        return team_a if global_a > global_b else team_b
-
-    # Desempate por gol de visitante (regla histórica en Liga MX hasta hace unos años)
-    away_goals_a = away_leg_b   # goles de A jugando de visitante (en la ida)
-    away_goals_b = home_leg_b   # goles de B jugando de visitante (en la vuelta)
-    if away_goals_a != away_goals_b:
-        return team_a if away_goals_a > away_goals_b else team_b
-
-    # Penales: aproximamos con 50/50 (opcionalmente podrías ponderar por Elo)
-    return random.choice([team_a, team_b])
-
-
-def simulate_liguilla(model: EnsemblePredictor, seeded_teams: list[str], n_simulations: int = 1000) -> dict:
-    """
-    seeded_teams: lista de 8 equipos clasificados, en orden de posición
-    (1ro al 8vo), como en el formato real de Liga MX (1 vs 8, 2 vs 7, etc.)
-
-    Devuelve la probabilidad de campeonar de cada equipo tras N simulaciones.
-    """
-    assert len(seeded_teams) == 8, "La liguilla de Liga MX se juega con 8 equipos"
-
+    sampler = _LegSampler(model, np.random.default_rng(seed))
+    position = {team: i for i, team in enumerate(seeded_teams)}
     champion_counts = {team: 0 for team in seeded_teams}
 
     for _ in range(n_simulations):
-        # Cuartos de final: 1v8, 4v5, 3v6, 2v7 (seeding estándar)
-        pairs = [
-            (seeded_teams[0], seeded_teams[7]),
-            (seeded_teams[3], seeded_teams[4]),
-            (seeded_teams[2], seeded_teams[5]),
-            (seeded_teams[1], seeded_teams[6]),
-        ]
-        semifinalists = [simulate_series(model, a, b) for a, b in pairs]
-
-        finalists = [
-            simulate_series(model, semifinalists[0], semifinalists[1]),
-            simulate_series(model, semifinalists[2], semifinalists[3]),
+        semifinalists = [
+            simulate_series(sampler, seeded_teams[i], seeded_teams[LIGUILLA_TEAMS - 1 - i])
+            for i in range(LIGUILLA_TEAMS // 2)
         ]
 
-        champion = simulate_series(model, finalists[0], finalists[1])
-        champion_counts[champion] += 1
+        a, b, c, d = sorted(semifinalists, key=position.get)
+        finalist_1 = simulate_series(sampler, a, d)
+        finalist_2 = simulate_series(sampler, b, c)
+
+        better, worse = sorted([finalist_1, finalist_2], key=position.get)
+        champion_counts[simulate_series(sampler, better, worse, is_final=True)] += 1
 
     return {team: round(count / n_simulations, 4) for team, count in champion_counts.items()}
 
@@ -83,15 +96,15 @@ def simulate_liguilla(model: EnsemblePredictor, seeded_teams: list[str], n_simul
 if __name__ == "__main__":
     from src.data_loader import load_processed
     from src.league_config import LIGA_MX
+    from src.utils import current_tournament, standings, tournament_name
 
     matches = load_processed(LIGA_MX)
     model = EnsemblePredictor(league=LIGA_MX).fit(matches)
 
-    # Ejemplo: reemplaza por los 8 equipos clasificados reales, en orden de posición
-    top8 = ["CF América", "Deportivo Toluca", "Cruz Azul", "CF Monterrey",
-            "UANL Tigres", "CF Pachuca", "Deportivo Guadalajara", "Pumas UNAM"]
-    probs = simulate_liguilla(model, top8, n_simulations=2000)
+    tournament = current_tournament(matches)
+    top8 = standings(tournament)["Equipo"].head(LIGUILLA_TEAMS).tolist()
+    probs = simulate_liguilla(model, top8, n_simulations=5000)
 
-    print("Probabilidad de ser campeón:")
+    print(f"Probabilidad de ser campeón, con el top 8 actual de {tournament_name(tournament)}:")
     for team, p in sorted(probs.items(), key=lambda x: -x[1]):
         print(f"  {team}: {p:.1%}")

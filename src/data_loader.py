@@ -1,25 +1,35 @@
 """
 data_loader.py
 --------------
-Descarga y limpia el histórico de partidos para cualquier liga soportada
-en league_config.py (World Cup/internacional, Liga MX, etc.).
+Descarga y limpia el histórico de partidos de Liga MX.
 
-El dataframe de salida siempre queda normalizado a las columnas:
-date, home_team, away_team, home_score, away_score, result
-sin importar cómo se llamen las columnas en la fuente original.
+El dataframe de salida queda normalizado a las columnas:
+date, season, home_team, away_team, home_score, away_score, result
+más los momios promedio de cierre (odds_home, odds_draw, odds_away), que el
+backtest usa como referencia del mercado.
+
+Como la liga sigue en curso, los datos locales caducan: load_processed vuelve
+a descargarlos si tienen más de MAX_DATA_AGE_HOURS horas.
 """
 
 from pathlib import Path
+import time
+
 import pandas as pd
 import requests
 
-from src.league_config import LeagueConfig, WORLD_CUP
+from src.league_config import LeagueConfig, LIGA_MX, TEAM_NAMES
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
+RAW_FILENAME = "liga_mx.csv"
+PROCESSED_FILENAME = "liga_mx_clean.csv"
+MAX_DATA_AGE_HOURS = 24
+
+ODDS_COLS = {"AvgCH": "odds_home", "AvgCD": "odds_draw", "AvgCA": "odds_away"}
 
 
-def download_data(url: str, filename: str) -> Path:
+def download_data(url: str, filename: str = RAW_FILENAME) -> Path:
     """Descarga el CSV crudo y lo guarda en data/raw/."""
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RAW_DIR / filename
@@ -32,68 +42,35 @@ def download_data(url: str, filename: str) -> Path:
     return out_path
 
 
-def load_raw(league: LeagueConfig, filename: str | None = None) -> pd.DataFrame:
-    """
-    Carga el CSV crudo desde data/raw/, descargándolo si hace falta.
-    Si league.data_source es una lista (multi-temporada), descarga cada URL
-    por separado y concatena los resultados en un solo dataframe.
-    """
-    sources = league.data_source if isinstance(league.data_source, list) else [league.data_source]
-
-    frames = []
-    for i, url in enumerate(sources):
-        part_filename = filename or f"{_safe_name(league.name)}_{i}.csv"
-        path = RAW_DIR / part_filename
-        if not path.exists():
-            path = download_data(url, part_filename)
-        frames.append(pd.read_csv(path))
-
-    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+def load_raw(league: LeagueConfig = LIGA_MX, refresh: bool = False) -> pd.DataFrame:
+    """Carga el CSV crudo desde data/raw/, descargándolo si falta o si refresh=True."""
+    path = RAW_DIR / RAW_FILENAME
+    if refresh or not path.exists():
+        path = download_data(league.data_source)
+    return pd.read_csv(path, encoding="utf-8-sig")
 
 
-def _safe_name(name: str) -> str:
-    return name.lower().replace(" ", "_").replace("/", "")
-
-
-def clean_data(df: pd.DataFrame, league: LeagueConfig) -> pd.DataFrame:
-    """
-    Limpieza y normalización de columnas según la config de la liga.
-    Renombra las columnas propias de cada fuente a un esquema común.
-    """
-    df = df.copy()
-
-    rename_map = {
+def clean_data(df: pd.DataFrame, league: LeagueConfig = LIGA_MX) -> pd.DataFrame:
+    """Limpia el CSV crudo y lo normaliza al esquema común del proyecto."""
+    df = df.rename(columns={
         league.date_col: "date",
         league.home_team_col: "home_team",
         league.away_team_col: "away_team",
         league.home_score_col: "home_score",
         league.away_score_col: "away_score",
-    }
-    df = df.rename(columns=rename_map)
+        "Season": "season",
+        **ODDS_COLS,
+    })
 
-    # Algunas fuentes (ej. footballcsv) traen el marcador como "2-1" en una sola
-    # columna "FT" en vez de dos columnas separadas. Lo separamos si aplica.
-    if "home_score" not in df.columns and "FT" in df.columns:
-        scores = df["FT"].str.split("-", expand=True)
-        df["home_score"] = scores[0]
-        df["away_score"] = scores[1]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", format=league.date_format)
+    df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce")
+    df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce")
 
-    # Partidos aún no jugados (marcador vacío, ej. jornadas futuras cacheadas
-    # de antemano) se descartan junto con cualquier otro nulo.
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", format="mixed")
-    df = df.dropna(subset=["date", "home_team", "away_team", "home_score", "away_score"])
+    # Partidos sin marcador (aún no jugados) se descartan junto con cualquier otro nulo.
+    df = df.dropna(subset=["date", "home_team", "away_team", "home_score", "away_score"]).copy()
 
-    # Algunas fuentes anotan marcadores especiales (ej. "0 (*)" = partido dado
-    # por perdido administrativamente, walkover, etc.). Extraemos solo el
-    # número inicial; si no hay número, la fila se descarta.
-    df["home_score"] = pd.to_numeric(
-        df["home_score"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce"
-    )
-    df["away_score"] = pd.to_numeric(
-        df["away_score"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce"
-    )
-    df = df.dropna(subset=["home_score", "away_score"])
-
+    df["home_team"] = df["home_team"].str.strip().replace(TEAM_NAMES)
+    df["away_team"] = df["away_team"].str.strip().replace(TEAM_NAMES)
     df["home_score"] = df["home_score"].astype(int)
     df["away_score"] = df["away_score"].astype(int)
 
@@ -103,19 +80,15 @@ def clean_data(df: pd.DataFrame, league: LeagueConfig) -> pd.DataFrame:
         axis=1,
     )
 
-    # Conservamos 'neutral' si la fuente la trae (ej. World Cup dataset).
-    # Si no existe (ej. Liga MX, donde casi todo se juega en casa del local),
-    # se asume False para todos los partidos.
-    if "neutral" in df.columns:
-        df["neutral"] = df["neutral"].astype(str).str.upper().isin(["TRUE", "1", "YES"])
-    else:
-        df["neutral"] = False
-
-    keep_cols = ["date", "home_team", "away_team", "home_score", "away_score", "result", "neutral"]
-    return df[keep_cols].sort_values("date").reset_index(drop=True)
+    keep_cols = [
+        "date", "season", "home_team", "away_team", "home_score", "away_score", "result",
+        *ODDS_COLS.values(),
+    ]
+    # mergesort: estable, conserva el orden de la fuente dentro de un mismo día
+    return df[keep_cols].sort_values("date", kind="mergesort").reset_index(drop=True)
 
 
-def save_processed(df: pd.DataFrame, filename: str) -> Path:
+def save_processed(df: pd.DataFrame, filename: str = PROCESSED_FILENAME) -> Path:
     """Guarda el dataframe limpio en data/processed/."""
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PROCESSED_DIR / filename
@@ -124,30 +97,43 @@ def save_processed(df: pd.DataFrame, filename: str) -> Path:
     return out_path
 
 
-def load_processed(league: LeagueConfig = WORLD_CUP, filename: str | None = None) -> pd.DataFrame:
-    """Carga el dataset ya limpio para la liga dada; si no existe, lo genera desde cero."""
-    filename = filename or f"{league.name.lower().replace(' ', '_').replace('/', '')}_clean.csv"
-    path = PROCESSED_DIR / filename
-    if path.exists():
-        return pd.read_csv(path, parse_dates=["date"])
-
-    raw = load_raw(league)
-    clean = clean_data(raw, league)
-    save_processed(clean, filename)
+def refresh_data(league: LeagueConfig = LIGA_MX) -> pd.DataFrame:
+    """Descarga la versión más reciente y regenera el dataset procesado."""
+    clean = clean_data(load_raw(league, refresh=True), league)
+    save_processed(clean)
     return clean
 
 
+def _age_hours(path: Path) -> float:
+    return (time.time() - path.stat().st_mtime) / 3600
+
+
+def load_processed(
+    league: LeagueConfig = LIGA_MX,
+    max_age_hours: float | None = MAX_DATA_AGE_HOURS,
+) -> pd.DataFrame:
+    """
+    Carga el dataset limpio. Si no existe, o si tiene más de max_age_hours,
+    lo actualiza desde la fuente (max_age_hours=None desactiva la caducidad).
+    Si la actualización falla pero hay una copia local, sigue con esa copia:
+    es mejor predecir con datos de ayer que tumbar el dashboard.
+    """
+    path = PROCESSED_DIR / PROCESSED_FILENAME
+
+    if not path.exists():
+        return refresh_data(league)
+
+    if max_age_hours is not None and _age_hours(path) > max_age_hours:
+        try:
+            return refresh_data(league)
+        except requests.RequestException as exc:
+            print(f"No se pudieron actualizar los datos, usando copia local: {exc}")
+
+    return pd.read_csv(path, parse_dates=["date"])
+
+
 if __name__ == "__main__":
-    import argparse
-    from src.league_config import LEAGUES
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--league", choices=list(LEAGUES), default="world_cup")
-    args = parser.parse_args()
-
-    league_cfg = LEAGUES[args.league]
-    raw_df = load_raw(league_cfg)
-    clean_df = clean_data(raw_df, league_cfg)
-    save_processed(clean_df, f"{args.league}_clean.csv")
-    print(clean_df.head())
+    clean_df = refresh_data()
+    print(clean_df.tail())
     print(f"\nTotal de partidos: {len(clean_df):,}")
+    print(f"Último partido: {clean_df['date'].max():%Y-%m-%d}")

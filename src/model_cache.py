@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.ensemble import EnsemblePredictor
-from src.league_config import LeagueConfig, WORLD_CUP
+from src.league_config import LeagueConfig, LIGA_MX
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "model_cache"
 
@@ -25,13 +25,15 @@ def _cache_key(matches: pd.DataFrame, league: LeagueConfig, elo_weight: float, p
     """Hash determinístico de los datos + parámetros, para invalidar la caché
     automáticamente si cualquiera de los dos cambia."""
     data_fingerprint = pd.util.hash_pandas_object(matches, index=False).sum()
-    raw = f"{league.name}|{elo_weight}|{poisson_weight}|{data_fingerprint}|{len(matches)}"
+    # repr(league) incluye todos los parámetros de la config, no solo el nombre:
+    # recalibrar home_advantage, por ejemplo, también debe invalidar la caché.
+    raw = f"{league!r}|{elo_weight}|{poisson_weight}|{data_fingerprint}|{len(matches)}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def load_or_fit(
     matches: pd.DataFrame,
-    league: LeagueConfig = WORLD_CUP,
+    league: LeagueConfig = LIGA_MX,
     elo_weight: float = 0.5,
     poisson_weight: float = 0.5,
 ) -> EnsemblePredictor:

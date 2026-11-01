@@ -1,8 +1,8 @@
 """
 dashboard.py
 ------------
-Day 3: Interfaz interactiva en Streamlit para explorar predicciones
-del ensemble Elo + Poisson.
+Day 3: Interfaz interactiva en Streamlit para explorar predicciones de
+Liga MX con el ensemble Elo + Poisson.
 
 Ejecutar con:
     streamlit run app/dashboard.py
@@ -20,11 +20,18 @@ import streamlit as st
 
 from src.data_loader import load_processed
 from src.ensemble import EnsemblePredictor
-from src.league_config import LEAGUES
+from src.liguilla import simulate_liguilla
 from src.model_cache import load_or_fit
-from src.utils import get_team_list, head_to_head
+from src.utils import (
+    LIGUILLA_TEAMS,
+    current_tournament,
+    get_team_list,
+    head_to_head,
+    standings,
+    tournament_name,
+)
 
-st.set_page_config(page_title="Match Predictor", layout="wide")
+st.set_page_config(page_title="Liga MX Predictor", layout="wide")
 
 def _skeleton_box(height: str, width: str = "100%", margin_bottom: str = "12px") -> str:
     """Un bloque gris con animación de brillo (shimmer), imitando la forma
@@ -59,66 +66,60 @@ def show_skeleton():
         unsafe_allow_html=True,
     )
 
-@st.cache_data
-def get_matches(league_key: str) -> pd.DataFrame:
-    return load_processed(LEAGUES[league_key])
+# ttl: el dataset caduca a las 24 h (ver load_processed); revisar cada hora
+# hace que un dashboard que lleva días abierto también tome los datos nuevos.
+@st.cache_data(ttl=3600)
+def get_matches() -> pd.DataFrame:
+    return load_processed()
 
 
 @st.cache_resource
-def get_model(league_key: str, elo_weight: float, poisson_weight: float, _matches: pd.DataFrame) -> EnsemblePredictor:
-    league = LEAGUES[league_key]
+def get_model(elo_weight: float, poisson_weight: float, data_version: str, _matches: pd.DataFrame) -> EnsemblePredictor:
     # load_or_fit reusa un modelo entrenado desde data/model_cache/ si ya existe
     # uno para estos mismos datos + parámetros; si no, entrena y lo guarda.
     # @st.cache_resource evita repetir esto entre interacciones dentro de una
     # misma sesión; load_or_fit evita reentrenar entre arranques distintos del
-    # dashboard (ej. tras reiniciar el proceso de streamlit).
-    return load_or_fit(_matches, league=league, elo_weight=elo_weight, poisson_weight=poisson_weight)
+    # dashboard (ej. tras reiniciar el proceso de streamlit). data_version va
+    # en la firma para que un partido nuevo no siga usando el modelo anterior.
+    return load_or_fit(_matches, elo_weight=elo_weight, poisson_weight=poisson_weight)
 
 
-st.title("Match Predictor")
+st.title("Liga MX Predictor")
 
 with st.sidebar:
     st.header("Configuración")
-    league_key = st.selectbox(
-        "Liga / competición",
-        options=list(LEAGUES.keys()),
-        format_func=lambda k: LEAGUES[k].name,
-    )
     elo_weight = st.slider("Peso del modelo Elo", 0.0, 1.0, 0.5, 0.05)
     poisson_weight = round(1 - elo_weight, 2)
     st.write(f"Peso del modelo Poisson: **{poisson_weight}**")
-
-league = LEAGUES[league_key]
-st.caption(f"Ensemble (Elo + Poisson) — {league.name}")
 
 skeleton = st.empty()
 with skeleton.container():
     show_skeleton()
 
-matches = get_matches(league_key)
-teams = get_team_list(matches)
+matches = get_matches()
+tournament = current_tournament(matches)
+teams = get_team_list(tournament)
+table = standings(tournament)
+last_match = matches["date"].max()
 
 skeleton.empty()
 
-model = get_model(league_key, elo_weight, poisson_weight, matches)
+st.caption(f"Ensemble (Elo + Poisson) — datos hasta el {last_match:%d/%m/%Y}")
+
+model = get_model(elo_weight, poisson_weight, f"{last_match:%Y-%m-%d}-{len(matches)}", matches)
 
 col1, col2 = st.columns(2)
 with col1:
-    home_team = st.selectbox("Equipo local", teams, index=teams.index("England") if "England" in teams else 0)
+    home_team = st.selectbox("Equipo local", teams, index=teams.index("América") if "América" in teams else 0)
 with col2:
-    away_team = st.selectbox("Equipo visitante", teams, index=teams.index("Argentina") if "Argentina" in teams else 1)
-
-neutral = st.checkbox(
-    "Sede neutral",
-    value=False,
-)
+    away_team = st.selectbox("Equipo visitante", teams, index=teams.index("Chivas") if "Chivas" in teams else 1)
 
 if home_team == away_team:
     st.warning("Selecciona dos equipos diferentes.")
 else:
-    result = model.predict(home_team, away_team, neutral=neutral)
+    result = model.predict(home_team, away_team)
 
-    st.subheader(f"{home_team} - {away_team}" + (" (sede neutral)" if neutral else ""))
+    st.subheader(f"{home_team} - {away_team}")
 
     probs_df = pd.DataFrame({
         "Resultado": [f"Gana {home_team}", "Empate", f"Gana {away_team}"],
@@ -131,7 +132,7 @@ else:
 
     fig = px.bar(probs_df, x="Resultado", y="Probabilidad", text_auto=".1%", color="Resultado")
     fig.update_layout(showlegend=False, yaxis_tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     c1, c2, c3 = st.columns(3)
     c1.metric(f"Gana {home_team}", f"{result['ensemble']['home_win']:.1%}")
@@ -152,34 +153,38 @@ else:
         else:
             st.dataframe(
                 h2h[["date", "home_team", "away_team", "home_score", "away_score"]],
-                use_container_width=True,
+                width="stretch",
             )
 
-if league.has_playoffs:
-    st.divider()
-    st.subheader("Simulador de liguilla")
-    st.caption("Selecciona los 8 equipos clasificados, en orden de posición (1° al 8°)")
+st.divider()
+st.subheader(f"Tabla general — {tournament_name(tournament)}")
+st.caption(f"Los {LIGUILLA_TEAMS} primeros clasifican directo a la liguilla.")
+st.dataframe(table, width="stretch")
 
-    from src.liguilla import simulate_liguilla
+st.divider()
+st.subheader("Simulador de liguilla")
+st.caption(
+    "Parte del top 8 actual de la tabla; puedes cambiarlo para probar otros "
+    "escenarios. El orden importa: es la siembra del 1° al 8°."
+)
 
-    default_top8 = teams[:8] if len(teams) >= 8 else teams
-    seeded = st.multiselect(
-        "Equipos clasificados (en orden: 1° a 8°)",
-        options=teams,
-        default=default_top8,
-        max_selections=8,
-    )
+seeded = st.multiselect(
+    "Equipos clasificados (en orden: 1° a 8°)",
+    options=teams,
+    default=table["Equipo"].head(LIGUILLA_TEAMS).tolist(),
+    max_selections=LIGUILLA_TEAMS,
+)
 
-    if len(seeded) == 8:
-        n_sims = st.slider("Número de simulaciones", 500, 5000, 2000, 500)
-        if st.button("Simular liguilla"):
-            with st.spinner("Simulando..."):
-                probs = simulate_liguilla(model, seeded, n_simulations=n_sims)
-            probs_df = pd.DataFrame(
-                {"Equipo": list(probs.keys()), "Prob. de ser campeón": list(probs.values())}
-            ).sort_values("Prob. de ser campeón", ascending=False)
-            fig2 = px.bar(probs_df, x="Equipo", y="Prob. de ser campeón", text_auto=".1%")
-            fig2.update_layout(yaxis_tickformat=".0%")
-            st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("Selecciona exactamente 8 equipos para simular la liguilla.")
+if len(seeded) == LIGUILLA_TEAMS:
+    n_sims = st.slider("Número de simulaciones", 500, 5000, 2000, 500)
+    if st.button("Simular liguilla"):
+        with st.spinner("Simulando..."):
+            probs = simulate_liguilla(model, seeded, n_simulations=n_sims)
+        probs_df = pd.DataFrame(
+            {"Equipo": list(probs.keys()), "Prob. de ser campeón": list(probs.values())}
+        ).sort_values("Prob. de ser campeón", ascending=False)
+        fig2 = px.bar(probs_df, x="Equipo", y="Prob. de ser campeón", text_auto=".1%")
+        fig2.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(fig2, width="stretch")
+else:
+    st.info(f"Selecciona exactamente {LIGUILLA_TEAMS} equipos para simular la liguilla.")

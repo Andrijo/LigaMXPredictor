@@ -1,7 +1,7 @@
 """
 elo.py
 ------
-Day 1: Sistema de rating Elo para selecciones de fútbol.
+Day 1: Sistema de rating Elo para equipos de Liga MX.
 """
 
 from collections import defaultdict
@@ -46,44 +46,39 @@ class EloModel:
     def get_rating(self, team: str) -> float:
         return self.ratings[team]
 
-    def _home_bonus(self, home_team: str, neutral: bool = False) -> float:
-        """Ventaja de local total: base + extra por altitud si aplica.
-        En sede neutral no aplica ningún bonus (ni home_advantage ni altitud),
-        porque ninguno de los dos equipos está jugando en su país/estadio."""
-        if neutral:
-            return 0.0
+    def _home_bonus(self, home_team: str) -> float:
+        """Ventaja de local total: base + extra por altitud si aplica."""
         bonus = self.home_advantage
         altitude = self.altitude_teams.get(home_team, 0)
         bonus += (altitude / 1000) * self.altitude_bonus_per_1000m
         return bonus
 
-    def predict(self, home_team: str, away_team: str, neutral: bool = False) -> dict:
-        """Devuelve probabilidades de victoria local / empate / victoria visitante.
-        neutral=True para partidos en sede neutral (ej. semifinales de un Mundial)."""
-        home_r = self.get_rating(home_team) + self._home_bonus(home_team, neutral)
+    def predict(self, home_team: str, away_team: str) -> dict:
+        """Devuelve probabilidades de victoria local / empate / victoria visitante."""
+        home_r = self.get_rating(home_team) + self._home_bonus(home_team)
         away_r = self.get_rating(away_team)
 
         p_home = expected_score(home_r, away_r)
 
         # Aproximación simple para separar el empate de la probabilidad continua de Elo
         p_draw = 0.28 - 0.10 * abs(p_home - 0.5) * 2
-        p_draw = max(p_draw, 0.05)
+        # Tope: el empate se reparte a mitades entre ambos lados, así que sin
+        # él un partido muy desigual deja al débil con probabilidad negativa
+        # (0% tras recortar), y en Liga MX esas sorpresas sí ocurren.
+        p_draw = min(p_draw, 1.5 * min(p_home, 1 - p_home))
 
         p_home_win = p_home - p_draw / 2
         p_away_win = 1 - p_home_win - p_draw
 
         return {
-            "home_win": round(max(p_home_win, 0), 4),
-            "draw": round(max(p_draw, 0), 4),
-            "away_win": round(max(p_away_win, 0), 4),
+            "home_win": round(p_home_win, 4),
+            "draw": round(p_draw, 4),
+            "away_win": round(p_away_win, 4),
         }
 
-    def update(self, home_team: str, away_team: str, home_score: int, away_score: int, neutral: bool = False):
-        """Actualiza los ratings tras un partido real.
-        Importante: si el partido fue en sede neutral y no lo marcamos así,
-        el modelo aprendería una ventaja de local inflada/errónea para ambos
-        equipos, contaminando el rating de futuros partidos."""
-        home_r = self.get_rating(home_team) + self._home_bonus(home_team, neutral)
+    def update(self, home_team: str, away_team: str, home_score: int, away_score: int):
+        """Actualiza los ratings tras un partido real."""
+        home_r = self.get_rating(home_team) + self._home_bonus(home_team)
         away_r = self.get_rating(away_team)
 
         expected_home = expected_score(home_r, away_r)
@@ -106,18 +101,14 @@ class EloModel:
 
     def fit(self, matches: pd.DataFrame):
         """Entrena el modelo procesando el histórico partido a partido, en orden cronológico.
-        Si el dataframe trae una columna 'neutral' (True/False), se respeta para
-        no aprender una ventaja de local falsa en partidos de sede neutral.
 
         Usa itertuples() en vez de iterrows(): iterrows() crea un objeto Series
         de pandas (con toda su sobrecarga de tipos/indexado) por cada fila, lo
         cual domina el tiempo de ejecución en datasets grandes. itertuples()
         devuelve namedtuples livianos y da el mismo resultado ~15-20x más rápido,
         sin cambiar la lógica del modelo."""
-        has_neutral_col = "neutral" in matches.columns
         for row in matches.itertuples(index=False):
-            neutral = bool(row.neutral) if has_neutral_col else False
-            self.update(row.home_team, row.away_team, row.home_score, row.away_score, neutral=neutral)
+            self.update(row.home_team, row.away_team, row.home_score, row.away_score)
         return self
 
     def top_teams(self, n: int = 10) -> pd.Series:
@@ -130,8 +121,8 @@ if __name__ == "__main__":
     matches = load_processed()
     model = EloModel().fit(matches)
 
-    print("Top 10 selecciones por rating Elo:")
+    print("Top 10 equipos por rating Elo:")
     print(model.top_teams(10))
 
     print("\nEjemplo de predicción:")
-    print(model.predict("Brazil", "Argentina"))
+    print(model.predict("América", "Chivas"))

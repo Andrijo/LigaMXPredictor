@@ -8,15 +8,15 @@ bien o si un cambio (ej. Dixon-Coles, pesos del ensemble) mejora o empeora
 las predicciones. Es la vara de medir para todo lo demás.
 
 Cómo funciona (walk-forward por año):
-  Para cada año Y desde --start-year hasta el último año con datos:
-    1. Se entrena con TODO lo anterior a Y (nunca datos futuros -> sin fuga
+  Para cada trimestre T desde --start-year hasta el último con datos:
+    1. Se entrena solo con lo anterior a T (nunca datos futuros -> sin fuga
        de información)
-    2. Se predice cada partido de Y
+    2. Se predice cada partido de T
     3. Se compara la predicción contra el resultado real
-    4. El Elo se actualiza partido a partido según se avanza por el año
-       (aprendizaje online real); el Poisson se reentrena una vez por año
-       (es un modelo por lotes, reentrenarlo partido a partido sería
-       demasiado costoso y no cambia la conclusión de forma material)
+    4. El Elo se actualiza partido a partido según se avanza (aprendizaje
+       online real); el Poisson se reentrena cada trimestre (es un modelo
+       por lotes, reentrenarlo partido a partido sería demasiado costoso y
+       no cambia la conclusión de forma material)
 
 Métricas:
   - Log-loss: penaliza fuerte estar muy seguro y equivocado (más bajo = mejor)
@@ -25,6 +25,9 @@ Métricas:
   - Baseline ingenuo: probabilidades fijas = frecuencia histórica de
     home_win/draw/away_win en el set de entrenamiento inicial. Si el modelo
     no le gana a esto, no está aportando nada.
+  - Mercado: probabilidades implícitas en el momio promedio de cierre, sin el
+    margen de las casas. Es la referencia difícil: ganarle en log-loss de
+    forma sostenida es muy raro.
 """
 
 import math
@@ -35,7 +38,8 @@ import pandas as pd
 
 from src.elo import EloModel
 from src.poisson_model import PoissonGoalModel
-from src.league_config import LeagueConfig, WORLD_CUP
+from src.league_config import LeagueConfig, LIGA_MX
+from src.utils import recent_window
 
 OUTCOMES = ("home_win", "draw", "away_win")
 
@@ -52,35 +56,53 @@ def _combine(elo_pred: dict, poisson_pred: dict, elo_weight: float, poisson_weig
     return {k: elo_weight * elo_pred[k] + poisson_weight * poisson_pred[k] for k in OUTCOMES}
 
 
+def _market_probs(odds_home: float, odds_draw: float, odds_away: float) -> dict | None:
+    """Probabilidades implícitas en los momios, normalizadas para quitar el
+    margen de la casa. None si al partido le faltan momios."""
+    inverse = [1 / odds for odds in (odds_home, odds_draw, odds_away)]
+    if any(math.isnan(p) for p in inverse):
+        return None
+    total = sum(inverse)
+    return {k: p / total for k, p in zip(OUTCOMES, inverse)}
+
+
 @dataclass
 class BacktestResult:
-    records: list = field(default_factory=list)  # cada uno: {elo, poisson, ensemble, naive, actual, date, ...}
+    records: list = field(default_factory=list)  # cada uno: {elo, poisson, ensemble, naive, market, actual, date, ...}
+
+    def _usable(self) -> list:
+        """Partidos con momios, para comparar todos los modelos sobre los
+        mismos partidos aunque a alguno le falte el mercado."""
+        return [r for r in self.records if r["market"] is not None]
 
     def log_loss(self, key: str) -> float:
         eps = 1e-15
+        records = self._usable()
         total = 0.0
-        for r in self.records:
+        for r in records:
             p = max(r[key][r["actual"]], eps)
             total += -math.log(p)
-        return total / len(self.records)
+        return total / len(records)
 
     def brier_score(self, key: str) -> float:
+        records = self._usable()
         total = 0.0
-        for r in self.records:
+        for r in records:
             p = r[key]
             for outcome in OUTCOMES:
                 actual = 1.0 if outcome == r["actual"] else 0.0
                 total += (p[outcome] - actual) ** 2
-        return total / len(self.records)
+        return total / len(records)
 
     def accuracy(self, key: str) -> float:
+        records = self._usable()
         correct = sum(
-            1 for r in self.records
+            1 for r in records
             if max(OUTCOMES, key=lambda o: r[key][o]) == r["actual"]
         )
-        return correct / len(self.records)
+        return correct / len(records)
 
-    def summary(self, keys: tuple[str, ...] = ("naive", "elo", "poisson", "ensemble")) -> pd.DataFrame:
+    def summary(self, keys: tuple[str, ...] = ("naive", "elo", "poisson", "ensemble", "market")) -> pd.DataFrame:
         rows = []
         for key in keys:
             rows.append({
@@ -98,13 +120,13 @@ def walk_forward_backtest(
     end_year: int | None = None,
     elo_weight: float = 0.5,
     poisson_weight: float = 0.5,
-    league: LeagueConfig = WORLD_CUP,
+    league: LeagueConfig = LIGA_MX,
     fit_rho: bool = True,
 ) -> BacktestResult:
     """
     Corre la validación walk-forward y devuelve un BacktestResult con las
-    predicciones (elo, poisson, ensemble, naive) y el resultado real de
-    cada partido, listo para calcular métricas con .summary().
+    predicciones (elo, poisson, ensemble, naive, market) y el resultado real
+    de cada partido, listo para calcular métricas con .summary().
     """
     matches = matches.sort_values("date").reset_index(drop=True)
     if end_year is None:
@@ -134,19 +156,16 @@ def walk_forward_backtest(
 
     result = BacktestResult()
 
-    for year in range(start_year, end_year + 1):
-        train_df = matches[matches["date"].dt.year < year]
-        test_df = matches[matches["date"].dt.year == year].sort_values("date")
-        if test_df.empty:
-            continue
+    test_matches = matches[matches["date"].dt.year.between(start_year, end_year)]
 
+    for quarter, test_df in test_matches.groupby(test_matches["date"].dt.to_period("Q")):
+        cutoff = quarter.start_time
+        train_df = recent_window(matches[matches["date"] < cutoff], league.poisson_window_years, as_of=cutoff)
         poisson_model = PoissonGoalModel().fit(train_df, fit_rho=fit_rho)
 
         for _, row in test_df.iterrows():
-            neutral = bool(row["neutral"]) if "neutral" in matches.columns else False
-
-            elo_pred = elo_model.predict(row["home_team"], row["away_team"], neutral=neutral)
-            poisson_pred = poisson_model.predict(row["home_team"], row["away_team"], neutral=neutral)
+            elo_pred = elo_model.predict(row["home_team"], row["away_team"])
+            poisson_pred = poisson_model.predict(row["home_team"], row["away_team"])
             ensemble_pred = _combine(elo_pred, poisson_pred, elo_weight, poisson_weight)
             actual = _actual_outcome(row["home_score"], row["away_score"])
 
@@ -158,11 +177,12 @@ def walk_forward_backtest(
                 "poisson": poisson_pred,
                 "ensemble": ensemble_pred,
                 "naive": naive_probs,
+                "market": _market_probs(row["odds_home"], row["odds_draw"], row["odds_away"]),
                 "actual": actual,
             })
 
-            # Elo se actualiza partido a partido según avanza el año (online real)
-            elo_model.update(row["home_team"], row["away_team"], row["home_score"], row["away_score"], neutral=neutral)
+            # Elo se actualiza partido a partido según avanza el torneo (online real)
+            elo_model.update(row["home_team"], row["away_team"], row["home_score"], row["away_score"])
 
     if not result.records:
         raise ValueError(f"No hubo partidos de test entre {start_year} y {end_year}.")
@@ -173,20 +193,17 @@ def walk_forward_backtest(
 if __name__ == "__main__":
     import argparse
     from src.data_loader import load_processed
-    from src.league_config import LEAGUES
 
     parser = argparse.ArgumentParser(description="Backtesting walk-forward del predictor")
-    parser.add_argument("--league", choices=list(LEAGUES), default="world_cup")
-    parser.add_argument("--start-year", type=int, default=2015)
+    parser.add_argument("--start-year", type=int, default=2018)
     parser.add_argument("--end-year", type=int, default=None)
     parser.add_argument("--elo-weight", type=float, default=0.5)
     parser.add_argument("--no-dixon-coles", action="store_true", help="Desactiva la corrección Dixon-Coles para comparar")
     args = parser.parse_args()
 
-    league_cfg = LEAGUES[args.league]
-    matches = load_processed(league_cfg)
+    matches = load_processed()
 
-    print(f"Backtesting {league_cfg.name}: {args.start_year} -> {args.end_year or 'último año disponible'}")
+    print(f"Backtesting Liga MX: {args.start_year} -> {args.end_year or 'último año disponible'}")
     print(f"Partidos de entrenamiento inicial: {len(matches[matches['date'].dt.year < args.start_year]):,}")
     print()
 
@@ -196,7 +213,6 @@ if __name__ == "__main__":
         end_year=args.end_year,
         elo_weight=args.elo_weight,
         poisson_weight=1 - args.elo_weight,
-        league=league_cfg,
         fit_rho=not args.no_dixon_coles,
     )
 
@@ -206,3 +222,4 @@ if __name__ == "__main__":
     print()
     print("Más bajo es mejor en log_loss y brier_score. Más alto es mejor en accuracy.")
     print("Si 'naive' gana en alguna métrica, ese modelo no está aportando nada ahí.")
+    print("'market' es el momio de cierre: la distancia a él es lo que le falta al modelo.")

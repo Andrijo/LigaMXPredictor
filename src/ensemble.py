@@ -9,7 +9,8 @@ import pandas as pd
 
 from src.elo import EloModel
 from src.poisson_model import PoissonGoalModel
-from src.league_config import LeagueConfig, WORLD_CUP
+from src.league_config import LeagueConfig, LIGA_MX
+from src.utils import recent_window
 
 
 class EnsemblePredictor:
@@ -17,7 +18,7 @@ class EnsemblePredictor:
         self,
         elo_weight: float = 0.5,
         poisson_weight: float = 0.5,
-        league: LeagueConfig = WORLD_CUP,
+        league: LeagueConfig = LIGA_MX,
     ):
         assert abs(elo_weight + poisson_weight - 1.0) < 1e-6, "Los pesos deben sumar 1"
         self.elo_weight = elo_weight
@@ -32,14 +33,12 @@ class EnsemblePredictor:
 
     def fit(self, matches: pd.DataFrame):
         self.elo_model.fit(matches)
-        self.poisson_model.fit(matches)
+        self.poisson_model.fit(recent_window(matches, self.league.poisson_window_years))
         return self
 
-    def predict(self, home_team: str, away_team: str, neutral: bool = False) -> dict:
-        """neutral=True para partidos en sede neutral (ej. semifinales de un Mundial,
-        como Argentina vs Inglaterra en Atlanta o Francia vs España en Texas)."""
-        elo_pred = self.elo_model.predict(home_team, away_team, neutral=neutral)
-        poisson_pred = self.poisson_model.predict(home_team, away_team, neutral=neutral)
+    def predict(self, home_team: str, away_team: str) -> dict:
+        elo_pred = self.elo_model.predict(home_team, away_team)
+        poisson_pred = self.poisson_model.predict(home_team, away_team)
 
         combined = {
             "home_win": round(
@@ -67,5 +66,5 @@ if __name__ == "__main__":
     matches = load_processed()
     model = EnsemblePredictor().fit(matches)
 
-    result = model.predict("Brazil", "Argentina")
+    result = model.predict("América", "Chivas")
     print(result)
