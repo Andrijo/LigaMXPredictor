@@ -5,6 +5,8 @@ Day 3: Combina el modelo Elo (Day 1) y el modelo Poisson (Day 2)
 en una predicción única, ponderando ambos enfoques.
 """
 
+from difflib import get_close_matches
+
 import pandas as pd
 
 from src.elo import EloModel
@@ -36,7 +38,19 @@ class EnsemblePredictor:
         self.poisson_model.fit(recent_window(matches, self.league.poisson_window_years))
         return self
 
+    def check_teams(self, *teams: str) -> None:
+        """Falla si algún equipo no está en los datos de entrenamiento. Sin esto,
+        un nombre mal escrito ("America") recibe el rating por defecto y produce
+        una predicción con apariencia normal pero sin sentido."""
+        known = self.elo_model.ratings
+        for team in teams:
+            if team not in known:
+                close = get_close_matches(team, known, n=1)
+                hint = f" ¿Quisiste decir '{close[0]}'?" if close else ""
+                raise ValueError(f"Equipo desconocido: '{team}'.{hint}")
+
     def predict(self, home_team: str, away_team: str) -> dict:
+        self.check_teams(home_team, away_team)
         elo_pred = self.elo_model.predict(home_team, away_team)
         poisson_pred = self.poisson_model.predict(home_team, away_team)
 

@@ -72,8 +72,9 @@ def simulate_liguilla(
     Devuelve la probabilidad de ser campeón de cada equipo.
     """
     assert len(seeded_teams) == LIGUILLA_TEAMS, "La liguilla de Liga MX se juega con 8 equipos"
+    model.check_teams(*seeded_teams)
 
-    sampler = _LegSampler(model, np.random.default_rng(seed))
+    sampler =_LegSampler(model, np.random.default_rng(seed))
     position = {team: i for i, team in enumerate(seeded_teams)}
     champion_counts = {team: 0 for team in seeded_teams}
 
