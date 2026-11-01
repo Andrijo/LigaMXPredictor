@@ -7,17 +7,9 @@ Funciones auxiliares compartidas entre módulos.
 import pandas as pd
 
 # 18 equipos a una sola vuelta: 18 * 17 / 2 partidos de fase regular por torneo.
+LEAGUE_TEAMS = 18
 REGULAR_SEASON_MATCHES = 153
 LIGUILLA_TEAMS = 8
-
-
-def recent_window(matches: pd.DataFrame, years: int | None, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Partidos de los últimos `years` años antes de as_of (por defecto, el
-    último partido del dataset). years=None devuelve todo."""
-    if years is None:
-        return matches
-    as_of = matches["date"].max() if as_of is None else as_of
-    return matches[matches["date"] >= as_of - pd.DateOffset(years=years)]
 
 
 def current_tournament(matches: pd.DataFrame) -> pd.DataFrame:

@@ -39,7 +39,6 @@ import pandas as pd
 from src.elo import EloModel
 from src.poisson_model import PoissonGoalModel
 from src.league_config import LeagueConfig, LIGA_MX
-from src.utils import recent_window
 
 OUTCOMES = ("home_win", "draw", "away_win")
 
@@ -160,8 +159,10 @@ def walk_forward_backtest(
 
     for quarter, test_df in test_matches.groupby(test_matches["date"].dt.to_period("Q")):
         cutoff = quarter.start_time
-        train_df = recent_window(matches[matches["date"] < cutoff], league.poisson_window_years, as_of=cutoff)
-        poisson_model = PoissonGoalModel().fit(train_df, fit_rho=fit_rho)
+        poisson_model = PoissonGoalModel(
+            half_life_days=league.poisson_half_life_days,
+            ridge=league.poisson_ridge,
+        ).fit(matches[matches["date"] < cutoff], fit_rho=fit_rho, as_of=cutoff)
 
         for _, row in test_df.iterrows():
             elo_pred = elo_model.predict(row["home_team"], row["away_team"])

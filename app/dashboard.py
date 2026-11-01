@@ -20,7 +20,14 @@ import streamlit as st
 
 from src.data_loader import load_processed
 from src.ensemble import EnsemblePredictor
-from src.liguilla import simulate_liguilla
+from src.fixtures import (
+    load_fixtures,
+    missing_fixtures,
+    played_fixtures,
+    scheduled_fixtures,
+    with_played_fixtures,
+)
+from src.liguilla import simulate_liguilla, simulate_tournament
 from src.model_cache import load_or_fit
 from src.utils import (
     LIGUILLA_TEAMS,
@@ -73,6 +80,11 @@ def get_matches() -> pd.DataFrame:
     return load_processed()
 
 
+@st.cache_data(ttl=3600)
+def get_fixtures(data_version: str, _tournament: pd.DataFrame) -> pd.DataFrame:
+    return load_fixtures(_tournament)
+
+
 @st.cache_resource
 def get_model(elo_weight: float, poisson_weight: float, data_version: str, _matches: pd.DataFrame) -> EnsemblePredictor:
     # load_or_fit reusa un modelo entrenado desde data/model_cache/ si ya existe
@@ -99,14 +111,20 @@ with skeleton.container():
 matches = get_matches()
 tournament = current_tournament(matches)
 teams = get_team_list(tournament)
-table = standings(tournament)
-last_match = matches["date"].max()
+data_version = f"{matches['date'].max():%Y-%m-%d}-{len(matches)}"
+
+fixtures = get_fixtures(data_version, tournament)
+tournament_to_date = with_played_fixtures(tournament, fixtures)
+scheduled = scheduled_fixtures(fixtures)
+missing = missing_fixtures(tournament, fixtures)
+table = standings(tournament_to_date)
+last_match = tournament_to_date["date"].max()
 
 skeleton.empty()
 
 st.caption(f"Ensemble (Elo + Poisson) — datos hasta el {last_match:%d/%m/%Y}")
 
-model = get_model(elo_weight, poisson_weight, f"{last_match:%Y-%m-%d}-{len(matches)}", matches)
+model = get_model(elo_weight, poisson_weight, data_version, matches)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -161,6 +179,37 @@ st.subheader(f"Tabla general — {tournament_name(tournament)}")
 st.caption(f"Los {LIGUILLA_TEAMS} primeros clasifican directo a la liguilla.")
 st.dataframe(table, width="stretch")
 
+recent_results = len(played_fixtures(fixtures))
+if recent_results:
+    st.caption(f"Incluye {recent_results} resultados recientes de ESPN que aún no están en la fuente principal.")
+
+st.divider()
+st.subheader("Proyección del torneo")
+
+if missing:
+    st.warning(
+        f"Faltan {missing} partidos en el calendario, así que la proyección no está "
+        "disponible. Sin calendario no se sabe quién juega de local."
+    )
+elif scheduled.empty:
+    st.info("La fase regular ya terminó: usa el simulador de liguilla.")
+else:
+    st.caption(
+        f"Simula los {len(scheduled)} partidos que faltan y la liguilla que resulte de "
+        "cada tabla final. Solo usa el modelo Poisson."
+    )
+    n_tournament_sims = st.slider("Número de simulaciones", 500, 5000, 2000, 500, key="tournament_sims")
+    if st.button("Simular torneo"):
+        with st.spinner("Simulando..."):
+            projection = simulate_tournament(model, tournament_to_date, scheduled, n_tournament_sims)
+        percent = st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)
+        st.dataframe(
+            projection,
+            width="stretch",
+            hide_index=True,
+            column_config={"Clasifica": percent, "Campeón": percent},
+        )
+
 st.divider()
 st.subheader("Simulador de liguilla")
 st.caption(
@@ -176,7 +225,7 @@ seeded = st.multiselect(
 )
 
 if len(seeded) == LIGUILLA_TEAMS:
-    n_sims = st.slider("Número de simulaciones", 500, 5000, 2000, 500)
+    n_sims = st.slider("Número de simulaciones", 500, 5000, 2000, 500, key="liguilla_sims")
     if st.button("Simular liguilla"):
         with st.spinner("Simulando..."):
             probs = simulate_liguilla(model, seeded, n_simulations=n_sims)

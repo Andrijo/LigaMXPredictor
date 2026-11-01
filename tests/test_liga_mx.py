@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 import requests
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -16,7 +17,6 @@ from src.liguilla import _LegSampler, simulate_liguilla, simulate_series
 from src.utils import (
     REGULAR_SEASON_MATCHES,
     current_tournament,
-    recent_window,
     standings,
     tournament_name,
 )
@@ -114,12 +114,6 @@ def test_standings_ignores_liguilla():
     assert table.loc["A", "GF"] == 0
 
 
-def test_recent_window_keeps_only_last_years():
-    df = pd.DataFrame([match("2023-01-01", "A", "B", 1, 0), match("2026-01-01", "A", "B", 1, 0)])
-    assert len(recent_window(df, 2)) == 1
-    assert len(recent_window(df, None)) == 2
-
-
 # --- liguilla --------------------------------------------------------------
 
 def rigged_model(matrix_for):
@@ -131,7 +125,10 @@ def rigged_model(matrix_for):
         matrix[matrix_for(home, away)] = 1.0
         return matrix
 
-    return SimpleNamespace(poisson_model=SimpleNamespace(score_matrix=score_matrix, max_goals=size - 1))
+    return SimpleNamespace(
+        poisson_model=SimpleNamespace(score_matrix=score_matrix, max_goals=size - 1),
+        check_teams=lambda *teams: None,
+    )
 
 
 def sampler_for(matrix_for, seed=0):
@@ -183,7 +180,34 @@ def test_liguilla_probabilities_sum_to_one():
     ]
     model = EnsemblePredictor().fit(pd.DataFrame(rows))
     probs = simulate_liguilla(model, teams, n_simulations=300, seed=7)
-    assert abs(sum(probs.values()) - 1) < 1e-6
+    assert abs(sum(probs.values()) - 1) < 1e-3   # cada valor va redondeado a 4 decimales
+
+
+# --- validación de equipos ---------------------------------------------------
+
+def fitted_model():
+    return EnsemblePredictor().fit(pd.DataFrame([
+        match("2026-08-01", "América", "Chivas", 2, 1),
+        match("2026-08-08", "Chivas", "América", 0, 0),
+    ]))
+
+
+def test_predict_rejects_unknown_team_and_suggests_name():
+    with pytest.raises(ValueError, match="¿Quisiste decir 'América'?"):
+        fitted_model().predict("America", "Chivas")
+
+
+def test_rejected_team_does_not_pollute_ratings():
+    """ratings es un defaultdict: leer un nombre nuevo lo crearía."""
+    model = fitted_model()
+    with pytest.raises(ValueError):
+        model.predict("Chivas", "Nadie FC")
+    assert "Nadie FC" not in model.elo_model.ratings
+
+
+def test_liguilla_rejects_unknown_team():
+    with pytest.raises(ValueError, match="Equipo desconocido"):
+        simulate_liguilla(fitted_model(), ["Nadie FC"] * 8, n_simulations=1)
 
 
 # --- backtest ---------------------------------------------------------------
