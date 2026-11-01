@@ -17,7 +17,6 @@ from src.liguilla import _LegSampler, simulate_liguilla, simulate_series
 from src.utils import (
     REGULAR_SEASON_MATCHES,
     current_tournament,
-    recent_window,
     standings,
     tournament_name,
 )
@@ -115,12 +114,6 @@ def test_standings_ignores_liguilla():
     assert table.loc["A", "GF"] == 0
 
 
-def test_recent_window_keeps_only_last_years():
-    df = pd.DataFrame([match("2023-01-01", "A", "B", 1, 0), match("2026-01-01", "A", "B", 1, 0)])
-    assert len(recent_window(df, 2)) == 1
-    assert len(recent_window(df, None)) == 2
-
-
 # --- liguilla --------------------------------------------------------------
 
 def rigged_model(matrix_for):
@@ -187,7 +180,7 @@ def test_liguilla_probabilities_sum_to_one():
     ]
     model = EnsemblePredictor().fit(pd.DataFrame(rows))
     probs = simulate_liguilla(model, teams, n_simulations=300, seed=7)
-    assert abs(sum(probs.values()) - 1) < 1e-6
+    assert abs(sum(probs.values()) - 1) < 1e-3   # cada valor va redondeado a 4 decimales
 
 
 # --- validación de equipos ---------------------------------------------------

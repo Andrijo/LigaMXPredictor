@@ -12,7 +12,6 @@ import pandas as pd
 from src.elo import EloModel
 from src.poisson_model import PoissonGoalModel
 from src.league_config import LeagueConfig, LIGA_MX
-from src.utils import recent_window
 
 
 class EnsemblePredictor:
@@ -31,11 +30,14 @@ class EnsemblePredictor:
             altitude_teams=league.altitude_teams,
             altitude_bonus_per_1000m=league.altitude_bonus_per_1000m,
         )
-        self.poisson_model = PoissonGoalModel()
+        self.poisson_model = PoissonGoalModel(
+            half_life_days=league.poisson_half_life_days,
+            ridge=league.poisson_ridge,
+        )
 
     def fit(self, matches: pd.DataFrame):
         self.elo_model.fit(matches)
-        self.poisson_model.fit(recent_window(matches, self.league.poisson_window_years))
+        self.poisson_model.fit(matches)
         return self
 
     def check_teams(self, *teams: str) -> None:

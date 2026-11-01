@@ -1,63 +1,116 @@
 """
 poisson_model.py
 -----------------
-Day 2: Modelo de goles esperados (attack/defense strength) + distribución
-de Poisson para simular marcadores exactos.
+Day 2: Modelo de goles Dixon-Coles (1997) para simular marcadores exactos.
 
-Incluye la corrección Dixon-Coles (1997): el Poisson "puro" asume que los
-goles de local y visitante son independientes, pero en la práctica los
-marcadores bajos (0-0, 1-0, 0-1, 1-1) están correlacionados de forma que el
-modelo puro los sub/sobre-estima sistemáticamente. Dixon-Coles corrige esas
-4 celdas con un factor tau(rho) ajustado por máxima verosimilitud sobre el
-histórico real.
+Cada equipo tiene una fuerza de ataque y una de defensa, y los goles esperados
+de un partido salen de combinarlas:
+
+    log(goles local)     = base + localía + ataque_local + defensa_visitante
+    log(goles visitante) = base + ataque_visitante + defensa_local
+
+Todo se ajusta a la vez por máxima verosimilitud, así que meterle dos goles a
+Cruz Azul cuenta más que meterle dos a FC Juárez. Dos añadidos sobre eso:
+
+  - Decaimiento temporal: el peso de un partido se reduce a la mitad cada
+    half_life_days días.
+  - Regularización (ridge): acerca las fuerzas al promedio de la liga para que
+    un equipo con pocos partidos no quede con valores extremos.
+
+Además incluye la corrección de Dixon-Coles: el Poisson "puro" asume que los
+goles de local y visitante son independientes, pero los marcadores bajos
+(0-0, 1-0, 0-1, 1-1) están correlacionados de forma que el modelo puro los
+sub/sobre-estima sistemáticamente. Esas 4 celdas se corrigen con un factor
+tau(rho), también ajustado por máxima verosimilitud.
 """
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize, minimize_scalar
 from scipy.stats import poisson
-from scipy.optimize import minimize_scalar
 
 
 class PoissonGoalModel:
-    def __init__(self, max_goals: int = 6, rho: float = 0.0):
+    def __init__(
+        self,
+        max_goals: int = 6,
+        rho: float = 0.0,
+        half_life_days: float | None = None,
+        ridge: float = 1.0,
+    ):
         self.max_goals = max_goals
         self.rho = rho  # 0.0 = sin corrección Dixon-Coles (Poisson puro)
-        self.avg_home_goals = None
-        self.avg_away_goals = None
+        self.half_life_days = half_life_days  # None = todos los partidos pesan igual
+        self.ridge = ridge
+        self.base = 0.0
+        self.home_advantage = 0.0
+        # En escala logarítmica: 0 = equipo promedio. Mayor ataque = mete más
+        # goles; mayor defensa = recibe más goles.
         self.team_attack: dict[str, float] = {}
         self.team_defense: dict[str, float] = {}
 
-    def fit(self, matches: pd.DataFrame, fit_rho: bool = True):
-        """Calcula fuerza de ataque/defensa relativa a la media de la liga.
-        Si fit_rho=True (default), también ajusta el parámetro Dixon-Coles
-        rho por máxima verosimilitud sobre los marcadores bajos del histórico.
+    def _match_weights(self, matches: pd.DataFrame, as_of: pd.Timestamp | None) -> np.ndarray:
+        if self.half_life_days is None:
+            return np.ones(len(matches))
+        as_of = matches["date"].max() if as_of is None else as_of
+        age_days = (as_of - matches["date"]).dt.days.to_numpy(dtype=float)
+        return 0.5 ** (age_days / self.half_life_days)
 
-        Usa groupby() en vez de filtrar el dataframe completo por cada equipo
-        (`matches[matches["home_team"] == team]` recorre todas las filas una
-        vez POR EQUIPO). groupby() hace el mismo cálculo en una sola pasada,
-        mismo resultado, mucho más rápido."""
-        self.avg_home_goals = matches["home_score"].mean()
-        self.avg_away_goals = matches["away_score"].mean()
-        league_avg = (self.avg_home_goals + self.avg_away_goals) / 2
+    def fit(self, matches: pd.DataFrame, fit_rho: bool = True, as_of: pd.Timestamp | None = None):
+        """Ajusta los parámetros por máxima verosimilitud con el gradiente
+        analítico, lo que mantiene el ajuste en fracciones de segundo.
+        as_of: fecha contra la que se mide la antigüedad de los partidos (por
+        defecto, el último partido). Si fit_rho=True (default), también ajusta
+        el parámetro Dixon-Coles rho."""
+        teams = sorted(set(matches["home_team"]) | set(matches["away_team"]))
+        team_index = {team: i for i, team in enumerate(teams)}
+        n = len(teams)
 
-        # Goles a favor: como local (home_score) + como visitante (away_score)
-        home_scored = matches.groupby("home_team")["home_score"].agg(["sum", "count"])
-        away_scored = matches.groupby("away_team")["away_score"].agg(["sum", "count"])
-        scored = home_scored.add(away_scored, fill_value=0)
+        home = matches["home_team"].map(team_index).to_numpy()
+        away = matches["away_team"].map(team_index).to_numpy()
+        home_goals = matches["home_score"].to_numpy(dtype=float)
+        away_goals = matches["away_score"].to_numpy(dtype=float)
+        weights = self._match_weights(matches, as_of)
+        ridge = self.ridge
 
-        # Goles en contra: como local (away_score recibido) + como visitante (home_score recibido)
-        home_conceded = matches.groupby("home_team")["away_score"].agg(["sum", "count"])
-        away_conceded = matches.groupby("away_team")["home_score"].agg(["sum", "count"])
-        conceded = home_conceded.add(away_conceded, fill_value=0)
+        def objective(params: np.ndarray) -> tuple[float, np.ndarray]:
+            base, home_adv = params[0], params[1]
+            attack, defense = params[2:2 + n], params[2 + n:]
 
-        attack = (scored["sum"] / scored["count"]) / league_avg
-        defense = (conceded["sum"] / conceded["count"]) / league_avg
+            log_home = base + home_adv + attack[home] + defense[away]
+            log_away = base + attack[away] + defense[home]
+            exp_home, exp_away = np.exp(log_home), np.exp(log_away)
 
-        self.team_attack = attack.fillna(1.0).to_dict()
-        self.team_defense = defense.fillna(1.0).to_dict()
+            log_likelihood = (weights * (
+                home_goals * log_home - exp_home + away_goals * log_away - exp_away
+            )).sum()
+            penalty = 0.5 * ridge * ((attack ** 2).sum() + (defense ** 2).sum())
+
+            home_residual = weights * (home_goals - exp_home)
+            away_residual = weights * (away_goals - exp_away)
+            grad = np.zeros_like(params)
+            grad[0] = -(home_residual.sum() + away_residual.sum())
+            grad[1] = -home_residual.sum()
+            grad[2:2 + n] = ridge * attack - (
+                np.bincount(home, home_residual, n) + np.bincount(away, away_residual, n)
+            )
+            grad[2 + n:] = ridge * defense - (
+                np.bincount(away, home_residual, n) + np.bincount(home, away_residual, n)
+            )
+            return penalty - log_likelihood, grad
+
+        start = np.zeros(2 + 2 * n)
+        start[0] = np.log(max(np.average(away_goals, weights=weights), 0.1))
+        start[1] = 0.25
+        params = minimize(objective, start, jac=True, method="L-BFGS-B").x
+
+        self.base = float(params[0])
+        self.home_advantage = float(params[1])
+        self.team_attack = dict(zip(teams, params[2:2 + n].tolist()))
+        self.team_defense = dict(zip(teams, params[2 + n:].tolist()))
 
         if fit_rho:
-            self.fit_rho(matches)
+            self.fit_rho(matches, as_of=as_of)
 
         return self
 
@@ -75,26 +128,26 @@ class PoissonGoalModel:
             return 1 - rho
         return 1.0
 
-    def fit_rho(self, matches: pd.DataFrame) -> float:
+    def fit_rho(self, matches: pd.DataFrame, as_of: pd.Timestamp | None = None) -> float:
         """
         Ajusta rho por máxima verosimilitud. Como tau=1 fuera de las 4 celdas
         de marcador bajo, la log-verosimilitud solo depende de rho a través de
-        esos partidos — filtramos a ellos y optimizamos de forma vectorizada
-        (rápido incluso con decenas de miles de partidos).
+        esos partidos — filtramos a ellos y optimizamos de forma vectorizada.
         """
-        home_attack = matches["home_team"].map(self.team_attack).fillna(1.0).to_numpy()
-        home_defense = matches["home_team"].map(self.team_defense).fillna(1.0).to_numpy()
-        away_attack = matches["away_team"].map(self.team_attack).fillna(1.0).to_numpy()
-        away_defense = matches["away_team"].map(self.team_defense).fillna(1.0).to_numpy()
+        attack = matches["home_team"].map(self.team_attack).to_numpy()
+        defense = matches["home_team"].map(self.team_defense).to_numpy()
+        away_attack = matches["away_team"].map(self.team_attack).to_numpy()
+        away_defense = matches["away_team"].map(self.team_defense).to_numpy()
 
-        lam = home_attack * away_defense * self.avg_home_goals
-        mu = away_attack * home_defense * self.avg_away_goals
+        lam = np.exp(self.base + self.home_advantage + attack + away_defense)
+        mu = np.exp(self.base + away_attack + defense)
 
         x = matches["home_score"].to_numpy()
         y = matches["away_score"].to_numpy()
+        weights = self._match_weights(matches, as_of)
 
-        mask = ((x == 0) & (y == 0)) | ((x == 0) & (y == 1)) | ((x == 1) & (y == 0)) | ((x == 1) & (y == 1))
-        lam_m, mu_m, x_m, y_m = lam[mask], mu[mask], x[mask], y[mask]
+        mask = (x <= 1) & (y <= 1)
+        lam_m, mu_m, x_m, y_m, w_m = lam[mask], mu[mask], x[mask], y[mask], weights[mask]
 
         if len(lam_m) == 0:
             self.rho = 0.0
@@ -112,39 +165,38 @@ class PoissonGoalModel:
             tau[idx10] = 1 + mu_m[idx10] * rho
             tau[idx11] = 1 - rho
             tau = np.clip(tau, 1e-6, None)  # tau debe ser > 0 para poder sacar log
-            return -np.sum(np.log(tau))
+            return -np.sum(w_m * np.log(tau))
 
         result = minimize_scalar(neg_log_likelihood, bounds=(-0.3, 0.3), method="bounded")
         self.rho = float(result.x)
         return self.rho
 
     def expected_goals(self, home_team: str, away_team: str) -> tuple[float, float]:
-        home_attack = self.team_attack.get(home_team, 1.0)
-        home_defense = self.team_defense.get(home_team, 1.0)
-        away_attack = self.team_attack.get(away_team, 1.0)
-        away_defense = self.team_defense.get(away_team, 1.0)
+        """Goles esperados. Un equipo sin partidos en el entrenamiento cuenta como promedio."""
+        home_attack = self.team_attack.get(home_team, 0.0)
+        home_defense = self.team_defense.get(home_team, 0.0)
+        away_attack = self.team_attack.get(away_team, 0.0)
+        away_defense = self.team_defense.get(away_team, 0.0)
 
-        exp_home_goals = home_attack * away_defense * self.avg_home_goals
-        exp_away_goals = away_attack * home_defense * self.avg_away_goals
+        exp_home_goals = np.exp(self.base + self.home_advantage + home_attack + away_defense)
+        exp_away_goals = np.exp(self.base + away_attack + home_defense)
 
-        return exp_home_goals, exp_away_goals
+        return float(exp_home_goals), float(exp_away_goals)
 
     def score_matrix(self, home_team: str, away_team: str) -> np.ndarray:
         """Matriz de probabilidad para cada marcador posible (home_goals x away_goals),
         con la corrección Dixon-Coles aplicada a las 4 celdas de marcador bajo si rho != 0."""
         exp_home, exp_away = self.expected_goals(home_team, away_team)
 
-        home_probs = [poisson.pmf(i, exp_home) for i in range(self.max_goals + 1)]
-        away_probs = [poisson.pmf(i, exp_away) for i in range(self.max_goals + 1)]
-
-        matrix = np.outer(home_probs, away_probs)
+        goals = np.arange(self.max_goals + 1)
+        matrix = np.outer(poisson.pmf(goals, exp_home), poisson.pmf(goals, exp_away))
 
         if self.rho != 0.0:
             for x, y in [(0, 0), (0, 1), (1, 0), (1, 1)]:
                 matrix[x, y] *= self._dixon_coles_tau(x, y, exp_home, exp_away, self.rho)
-            matrix = matrix / matrix.sum()  # renormalizar: la corrección redistribuye masa
 
-        return matrix
+        # La corrección redistribuye masa y la matriz corta en max_goals
+        return matrix / matrix.sum()
 
     def top_scores(self, home_team: str, away_team: str, n: int = 3) -> list[tuple[str, float]]:
         """Devuelve los n marcadores más probables como [('1-1', 0.14), ('1-0', 0.11), ...].
@@ -182,10 +234,15 @@ class PoissonGoalModel:
 
 if __name__ == "__main__":
     from src.data_loader import load_processed
+    from src.league_config import LIGA_MX
 
     matches = load_processed()
-    model = PoissonGoalModel().fit(matches)
+    model = PoissonGoalModel(
+        half_life_days=LIGA_MX.poisson_half_life_days,
+        ridge=LIGA_MX.poisson_ridge,
+    ).fit(matches)
 
     print(f"Rho (Dixon-Coles) ajustado: {model.rho:.4f}")
+    print(f"Ventaja de local: {np.exp(model.home_advantage):.2f}x goles")
     print("Predicción América vs Chivas:")
     print(model.predict("América", "Chivas"))

@@ -82,18 +82,22 @@ Resultados con datos hasta octubre de 2026 (2,943 partidos desde 2018):
 |----------|----------|--------|----------|
 | Ingenuo  | 1.0697   | 0.6464 | 45.2%    |
 | Elo      | 1.0303   | 0.6175 | 49.2%    |
-| Poisson  | 1.0278   | 0.6161 | 48.7%    |
-| Ensemble | 1.0259   | 0.6150 | 49.3%    |
+| Poisson  | 1.0278   | 0.6166 | 48.9%    |
+| Ensemble | 1.0242   | 0.6142 | 49.4%    |
 | Mercado  | 1.0079   | 0.6032 | 50.5%    |
 
 El ensemble le gana con claridad al baseline, pero sigue lejos del mercado: no
 sirve para encontrar valor contra las casas de apuestas.
 
-Los parámetros de `LIGA_MX` salieron de este backtest: `home_advantage=60`,
-bonus de altitud en 0 (con 25 empeoraba Elo tanto en 2018-2023 como en 2024-2026)
-y Poisson con ventana de 2 años. Cada modelo por separado mejora, pero el ensemble queda
-prácticamente igual que con los valores anteriores: combinar modelos ya absorbía
-esos errores. El simulador de liguilla usa solo Poisson, así que ahí sí importa.
+Los parámetros de `LIGA_MX` salieron de este backtest: `home_advantage=60`, bonus
+de altitud en 0 (con 25 empeoraba Elo tanto en 2018-2023 como en 2024-2026),
+y Poisson con vida media de 730 días y `ridge=16`, elegidos por log-loss de
+marcador exacto en 2018-2023.
+
+El Poisson por máxima verosimilitud mejora el marcador exacto (-0.0134 en todo el
+periodo, IC 95% de -0.0197 a -0.0071), que es lo que usa el simulador de liguilla.
+En 2024-2026 la mejora es menor y no concluyente (-0.0069, IC 95% de -0.0199 a
++0.0057). En el ensemble 1X2 la diferencia está dentro del ruido.
 
 ### 4. Simulación de liguilla
 

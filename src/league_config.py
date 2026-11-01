@@ -58,7 +58,8 @@ class LeagueConfig:
     home_advantage: float = 60       # bonus base de Elo por jugar de local
     altitude_teams: dict = field(default_factory=dict)  # equipo -> metros
     altitude_bonus_per_1000m: float = 25  # puntos Elo extra por cada 1000m de altitud
-    poisson_window_years: int | None = None  # años recientes para el Poisson (None = todos)
+    poisson_half_life_days: float | None = None  # el peso de un partido cae a la mitad cada N días
+    poisson_ridge: float = 1.0        # cuánto se acercan las fuerzas al promedio de la liga
 
 
 LIGA_MX = LeagueConfig(
@@ -76,7 +77,7 @@ LIGA_MX = LeagueConfig(
     home_advantage=60,
     altitude_teams=LIGA_MX_ALTITUDE_TEAMS,
     altitude_bonus_per_1000m=0,
-    # Con planteles que rotan cada torneo, lo que hizo un equipo hace más de
-    # dos años dice poco de su fuerza actual.
-    poisson_window_years=2,
+    # Elegidos por log-loss de marcador exacto en 2018-2023 (ver README).
+    poisson_half_life_days=730,
+    poisson_ridge=16,
 )
