@@ -7,6 +7,7 @@ Funciones auxiliares compartidas entre módulos.
 import pandas as pd
 
 # 18 equipos a una sola vuelta: 18 * 17 / 2 partidos de fase regular por torneo.
+LEAGUE_TEAMS = 18
 REGULAR_SEASON_MATCHES = 153
 LIGUILLA_TEAMS = 8
 

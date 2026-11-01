@@ -13,12 +13,13 @@ División desde el Apertura 2012, más un simulador de liguilla Monte Carlo.
 │   └── processed/        # datos limpios listos para modelar
 ├── src/
 │   ├── data_loader.py    # descarga, limpieza y actualización de datos
+│   ├── fixtures.py        # calendario de los partidos pendientes
 │   ├── elo.py             # Day 1 - modelo Elo
 │   ├── poisson_model.py   # Day 2 - modelo de goles Poisson (Dixon-Coles)
 │   ├── ensemble.py        # Day 3 - combina Elo + Poisson
 │   ├── league_config.py   # parámetros de Liga MX y nombres de equipos
 │   ├── backtest.py        # validación walk-forward fuera de muestra
-│   ├── liguilla.py        # simulador de liguilla Monte Carlo
+│   ├── liguilla.py        # simulación Monte Carlo del torneo y la liguilla
 │   ├── model_cache.py     # persistencia de modelos entrenados en disco
 │   └── utils.py           # tabla general, torneos y utilidades
 ├── app/
@@ -62,8 +63,8 @@ Python donde lo instalaste:
 python -m streamlit run app/dashboard.py
 ```
 
-El dashboard incluye predicción por partido, tabla general del torneo en curso
-y simulador de liguilla a partir del top 8 actual.
+El dashboard incluye predicción por partido, tabla general del torneo en curso,
+proyección del resto del torneo y simulador de liguilla a partir del top 8 actual.
 
 ### 3. Backtesting walk-forward
 
@@ -99,15 +100,25 @@ periodo, IC 95% de -0.0197 a -0.0071), que es lo que usa el simulador de liguill
 En 2024-2026 la mejora es menor y no concluyente (-0.0069, IC 95% de -0.0199 a
 +0.0057). En el ensemble 1X2 la diferencia está dentro del ruido.
 
-### 4. Simulación de liguilla
+### 4. Proyección del torneo y liguilla
 
 ```bash
 python -m src.liguilla
 ```
 
-Simula cuartos, semis y final con Monte Carlo sobre la matriz de marcadores del
-modelo Poisson y devuelve la probabilidad de campeonar de cada equipo. Sigue el
-formato vigente, verificado contra las liguillas de 2023 a 2026:
+Simula los partidos que faltan de la fase regular y la liguilla que resulte de
+cada tabla final, con Monte Carlo sobre la matriz de marcadores del modelo
+Poisson. Devuelve puntos esperados y la probabilidad de clasificar y de campeonar
+de cada equipo. Si la fase regular ya terminó o falta parte del calendario, simula
+solo la liguilla con el top 8 actual.
+
+Validada en 17 torneos desde 2017, cortando cada uno con 21 partidos por jugar y
+usando solo lo que se sabía en ese momento. Para predecir quién clasifica, su
+Brier score fue 0.074, contra 0.118 de asumir que el top 8 de ese momento ya
+estaba adentro; ganó en 14 de 17 torneos. La validación es orientativa porque los
+parámetros del modelo se eligieron con parte de esos años.
+
+La liguilla sigue el formato vigente, verificado contra las liguillas de 2023 a 2026:
 
 - Clasifican directo los 8 primeros, sin Play-In.
 - Cuartos: 1 vs 8, 2 vs 7, 3 vs 6, 4 vs 5.
@@ -116,7 +127,7 @@ formato vigente, verificado contra las liguillas de 2023 a 2026:
 - Con global empatado, en cuartos y semis pasa el mejor sembrado. En la final
   hay tiempos extra y penales (aproximados con 50/50). No hay gol de visitante.
 
-El peso de Elo del dashboard no afecta esta simulación, porque Elo no predice
+El peso de Elo del dashboard no afecta estas simulaciones, porque Elo no predice
 marcadores.
 
 ### 5. Caché de modelos
@@ -153,3 +164,9 @@ Resultados y momios de cierre de [football-data.co.uk](https://www.football-data
 fase regular y liguilla desde 2012/13. La fuente no marca qué partidos son de
 liguilla, por eso la tabla general toma los primeros 153 partidos de cada torneo.
 Tampoco trae calendario: solo partidos ya jugados, y puede ir unos días atrás.
+
+El calendario pendiente y los resultados más recientes salen del marcador público
+de ESPN, una API no oficial y sin documentar que puede cambiar sin aviso. Si falla,
+se usa la última copia local; si aun así falta algún partido, el dashboard desactiva
+la proyección en lugar de adivinar quién es local. Esos resultados actualizan la
+tabla, pero el modelo solo se entrena con football-data.co.uk.
